@@ -1,0 +1,37 @@
+[
+  {
+    "method": "KMeans-Baseline",
+    "runtime_s": 1.05,
+    "n_clusters": 5,
+    "silhouette": 0.2584,
+    "inertia": 8217.19,
+    "cluster_sizes": {
+      "0": 437,
+      "1": 87,
+      "2": 194,
+      "3": 36,
+      "4": 246
+    }
+  },
+  {
+    "method": "KMeans-BestK(k=2)",
+    "runtime_s": 5.43,
+    "n_clusters": 2,
+    "silhouette": 0.9516,
+    "inertia": 8823.13,
+    "cluster_sizes": {
+      "0": 988,
+      "1": 12
+    }
+  },
+  {
+    "method": "CDPC-KNN-Approx",
+    "runtime_s": 1.71,
+    "n_clusters": 2,
+    "silhouette": 0.9516,
+    "cluster_sizes": {
+      "0": 988,
+      "1": 12
+    }
+  }
+]
