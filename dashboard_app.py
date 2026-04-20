@@ -1,19 +1,18 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
 import plotly.express as px
 import plotly.graph_objects as go
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Insider Threat Detection Dashboard",
+    page_title="CERT Insider Threat — Interactive Dashboard",
     page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+# ── Dark theme CSS ────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
   [data-testid="stAppViewContainer"] { background: #0F1117; color: #E2E8F0; }
@@ -33,13 +32,91 @@ st.markdown("""
     margin: 1.5rem 0 0.6rem; text-transform: uppercase; letter-spacing: 0.08em;
   }
   hr { border-color: #2D3748; }
+  .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+  .stTabs [data-baseweb="tab"] { padding: 10px 20px; border-radius: 8px 8px 0 0; }
+  .best-k-badge {
+    background: linear-gradient(135deg, #7C3AED, #A78BFA);
+    color: white; padding: 6px 16px; border-radius: 999px;
+    font-weight: 700; font-size: 1rem; display: inline-block;
+  }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-COMPANY_DOMAIN = "dtaa.com"
+# ── Load data ─────────────────────────────────────────────────────────────────
+@st.cache_data
+def load_final_model():
+    return pd.read_csv("final_model_comparison.csv")
 
-COLORS = {
+@st.cache_data
+def load_silhouette_vs_k():
+    return pd.read_csv("silhouette_comparison_only.csv")
+
+@st.cache_data
+def load_top_anomalies():
+    return pd.read_csv("top_anomalies.csv")
+
+# Rebuild silhouette-vs-k table from notebook cell b2653218
+K_RANGE = list(range(2, 9))
+SPARK_K_RESULTS = {
+    2: {"silhouette": 0.387720, "training_cost": 2103.536950, "iterations": 3},
+    3: {"silhouette": 0.557892, "training_cost": 1224.442133, "iterations": 5},
+    4: {"silhouette": 0.572322, "training_cost": 1041.457561, "iterations": 18},
+    5: {"silhouette": 0.582903, "training_cost": 845.246647,  "iterations": 20},
+    6: {"silhouette": 0.554975, "training_cost": 718.327776,  "iterations": 15},
+    7: {"silhouette": 0.563645, "training_cost": 647.185795,  "iterations": 13},
+    8: {"silhouette": 0.572921, "training_cost": 601.444670,  "iterations": 12},
+}
+sil_df = pd.DataFrame([
+    {"k": k, "silhouette": v["silhouette"], "training_cost": v["training_cost"], "iterations": v["iterations"]}
+    for k, v in SPARK_K_RESULTS.items()
+])
+
+# Rebuild cluster profiles from notebook analysis
+# Features used: total_emails, total_recipients, mean_recipients, external_recipients,
+# off_hours_emails, weekend_emails, avg_hour, avg_email_size, unique_pcs,
+# external_ratio, off_hours_ratio, weekend_ratio
+FEATURE_COLS = [
+    "total_emails", "total_recipients", "mean_recipients",
+    "external_recipients", "off_hours_emails", "weekend_emails",
+    "avg_hour", "avg_email_size", "unique_pcs",
+    "external_ratio", "off_hours_ratio", "weekend_ratio"
+]
+FEATURE_LABELS = [
+    "Total Emails", "Total Recipients", "Mean Recipients",
+    "External Recipients", "Off-Hours Emails", "Weekend Emails",
+    "Avg Hour", "Avg Email Size", "Unique PCs",
+    "External Ratio", "Off-Hours Ratio", "Weekend Ratio"
+]
+
+# Reconstruct cluster centroid profiles from top_anomalies.csv and final_model_comparison.csv
+# Cluster assignments: 0=Normal, 1=Off-Hours Pattern, 2=Weekend Activity, 3=Anomaly, 4=High External
+anomaly_df = load_top_anomalies()
+model_df = load_final_model()
+
+# Build per-cluster centroid fingerprints from the features column
+def parse_features(features_str):
+    import ast
+    return np.array(ast.literal_eval(features_str))
+
+# Use top_anomalies to derive cluster centroids
+clusterCentroids = {}
+for cluster_id in sorted(anomaly_df["custom_cluster"].unique()):
+    cluster_rows = anomaly_df[anomaly_df["custom_cluster"] == cluster_id]
+    centroid = np.zeros(len(FEATURE_COLS))
+    for _, row in cluster_rows.iterrows():
+        centroid += parse_features(row["features"])
+    centroid /= len(cluster_rows)
+    clusterCentroids[cluster_id] = centroid
+
+CLUSTER_NAMES = {
+    0: "Normal Baseline",
+    1: "Off-Hours Pattern",
+    2: "Weekend Activity",
+    3: "Elevated Suspicion",
+    4: "High-Risk Exfiltrators",
+}
+
+CLUSTER_COLORS = {
     "High-Risk Exfiltrators": "#EF4444",
     "Elevated Suspicion":     "#F59E0B",
     "Weekend Activity":       "#8B5CF6",
@@ -47,544 +124,525 @@ COLORS = {
     "Normal Baseline":        "#10B981",
 }
 
-# ── Data loading & feature engineering (mirrors notebook exactly) ─────────────
-@st.cache_data
-def load_and_process(path: str) -> pd.DataFrame:
-    """Load email_filtered.csv and reproduce the notebook's feature engineering."""
-    df = pd.read_csv(path)
+# Normalize centroids to [0,1] for radar chart
+all_centroids = np.vstack(list(clusterCentroids.values()))
+min_vals = all_centroids.min(axis=0)
+max_vals = all_centroids.max(axis=0)
+ranges = max_vals - min_vals
+ranges[ranges == 0] = 1
+norm_centroids = {}
+for cid, cent in clusterCentroids.items():
+    norm_centroids[cid] = (cent - min_vals) / ranges
 
-    # --- parse timestamps ---
-    df["date_ts"] = pd.to_datetime(df["date"], format="%m/%d/%Y %H:%M:%S", errors="coerce")
-    df = df.dropna(subset=["date_ts", "user"])
-
-    # fill nulls
-    for c in ["to", "cc", "bcc", "from", "content"]:
-        if c in df.columns:
-            df[c] = df[c].fillna("")
-    for c in ["size", "attachments"]:
-        if c in df.columns:
-            df[c] = df[c].fillna(0)
-
-    # --- time flags ---
-    df["day"]       = df["date_ts"].dt.date
-    df["hour"]      = df["date_ts"].dt.hour
-    df["weekday"]   = df["date_ts"].dt.dayofweek   # 0=Mon ... 6=Sun
-    df["off_hours"] = ((df["hour"] < 8) | (df["hour"] > 18)).astype(int)
-    df["weekend"]   = df["weekday"].isin([5, 6]).astype(int)
-
-    # --- extract emails from mailto: links ---
-    def extract_mailto(series: pd.Series) -> pd.Series:
-        return series.str.extract(r"mailto:([^)]+)", expand=False).str.lower().fillna("")
-
-    df["to_email"]  = extract_mailto(df["to"])
-    df["cc_email"]  = extract_mailto(df["cc"])
-    df["bcc_email"] = extract_mailto(df["bcc"])
-
-    def is_external(email: pd.Series) -> pd.Series:
-        return (email.str.len() > 0) & (~email.str.endswith(f"@{COMPANY_DOMAIN}"))
-
-    def has_email(email: pd.Series) -> pd.Series:
-        return (email.str.len() > 0).astype(int)
-
-    df["recipient_count"] = (
-        has_email(df["to_email"]) +
-        has_email(df["cc_email"]) +
-        has_email(df["bcc_email"])
+# ── Helper: plotly dark template ─────────────────────────────────────────────
+def dark_layout(fig, **kwargs):
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(15,17,23,0.8)",
+        font_color="#E2E8F0",
+        **kwargs
     )
-    df["external_recipient_count"] = (
-        is_external(df["to_email"]).astype(int) +
-        is_external(df["cc_email"]).astype(int) +
-        is_external(df["bcc_email"]).astype(int)
-    )
-
-    # --- aggregate per user-day ---
-    agg = (
-        df.groupby(["user", "day"])
-        .agg(
-            total_emails          =("id", "count"),
-            total_recipients      =("recipient_count", "sum"),
-            mean_recipients       =("recipient_count", "mean"),
-            external_recipients   =("external_recipient_count", "sum"),
-            off_hours_emails      =("off_hours", "sum"),
-            weekend_emails        =("weekend", "sum"),
-            avg_hour              =("hour", "mean"),
-            avg_email_size        =("size", "mean"),
-            unique_pcs            =("pc", "nunique"),
-        )
-        .reset_index()
-    )
-
-    agg["external_ratio"]  = agg["external_recipients"] / agg["total_recipients"].replace(0, 1)
-    agg["off_hours_ratio"] = agg["off_hours_emails"]    / agg["total_emails"].replace(0, 1)
-    agg["weekend_ratio"]   = agg["weekend_emails"]      / agg["total_emails"].replace(0, 1)
-    agg = agg.fillna(0)
-
-    # --- anomaly score (weighted composite, mirrors notebook) ---
-    agg["anomaly_score"] = (
-        0.35 * agg["external_ratio"] +
-        0.30 * agg["off_hours_ratio"] +
-        0.20 * agg["weekend_ratio"] +
-        0.10 * (agg["total_emails"]   / agg["total_emails"].max()) +
-        0.05 * (agg["avg_email_size"] / agg["avg_email_size"].max())
-    ).round(4)
-
-    agg["risk_level"] = pd.cut(
-        agg["anomaly_score"],
-        bins=[0, 0.25, 0.50, 1.01],
-        labels=["Low", "Medium", "High"]
-    )
-
-    # --- cluster assignment (mirrors k=5 notebook result) ---
-    def assign_cluster(row):
-        if row["external_ratio"] > 0.6 and row["off_hours_ratio"] > 0.5:
-            return "High-Risk Exfiltrators"
-        elif row["external_ratio"] > 0.35 or row["off_hours_ratio"] > 0.35:
-            return "Elevated Suspicion"
-        elif row["weekend_ratio"] > 0.4:
-            return "Weekend Activity"
-        elif row["off_hours_ratio"] > 0.2:
-            return "Off-Hours Pattern"
-        else:
-            return "Normal Baseline"
-
-    agg["cluster_name"] = agg.apply(assign_cluster, axis=1)
-
-    return agg
-
-
-def color_risk(val):
-    if val == "High":   return "background-color:#7F1D1D;color:#FCA5A5"
-    if val == "Medium": return "background-color:#78350F;color:#FCD34D"
-    return "background-color:#064E3B;color:#6EE7B7"
-
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🛡️ CERT Threat Dashboard")
-
-    csv_path = st.text_input("Path to email_filtered.csv", value="data/email_filtered.csv")
-
-    try:
-        df = load_and_process(csv_path)
-        st.success(f"Loaded {len(df):,} user-day records")
-    except FileNotFoundError:
-        st.error(f"File not found: `{csv_path}`\n\nUpdate the path above.")
-        st.stop()
-    except Exception as e:
-        st.error(f"Error loading file: {e}")
-        st.stop()
-
-    st.markdown("---")
-    view = st.radio("View", ["📊 Overview", "🔍 User Drilldown", "🤖 Cluster Analysis", "📡 Anomaly Explorer"])
-
-    st.markdown("---")
-    st.markdown("**Filters**")
-    risk_filter    = st.multiselect("Risk Level", ["High", "Medium", "Low"], default=["High", "Medium", "Low"])
-    cluster_filter = st.multiselect("Cluster", list(COLORS.keys()), default=list(COLORS.keys()))
-
-    all_users = sorted(df["user"].unique())
-    st.markdown(f"<span style='color:#64748B;font-size:0.75rem'>{df['user'].nunique()} unique users<br>{len(df):,} user-day records</span>", unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown("<span style='color:#64748B;font-size:0.75rem'>CERT Insider Threat Dataset<br>email_filtered.csv</span>", unsafe_allow_html=True)
-
-# Apply filters
-filtered = df[
-    df["risk_level"].isin(risk_filter) &
-    df["cluster_name"].isin(cluster_filter)
-].copy()
-
-
-# ── PCA projection using actual features ──────────────────────────────────────
-@st.cache_data
-def compute_pca(data: pd.DataFrame):
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.decomposition import PCA
-
-    feat_cols = ["external_ratio", "off_hours_ratio", "weekend_ratio",
-                 "total_emails", "avg_email_size", "unique_pcs"]
-    user_agg = data.groupby("user")[feat_cols].mean().reset_index()
-    X = StandardScaler().fit_transform(user_agg[feat_cols])
-    coords = PCA(n_components=2, random_state=42).fit_transform(X)
-    user_agg["PC1"] = coords[:, 0]
-    user_agg["PC2"] = coords[:, 1]
-
-    user_meta = (
-        data.groupby("user")
-        .agg(cluster_name=("cluster_name", lambda x: x.mode()[0]),
-             max_anomaly=("anomaly_score", "max"))
-        .reset_index()
-    )
-    return user_agg.merge(user_meta, on="user")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VIEW 1 — OVERVIEW
+# PAGE 1 — K SELECTION LAB
 # ══════════════════════════════════════════════════════════════════════════════
-if view == "📊 Overview":
-    st.markdown("# Insider Threat Detection — Overview")
-    st.markdown(f"Behavioral clustering of **{df['user'].nunique()} users** across **{len(df):,} user-day records** from `email_filtered.csv`.")
+def page1_k_selection():
+    st.markdown("# K Selection Lab")
+    st.markdown("*How do we know k=5 is the right number of clusters? Let's ask the data.*")
 
-    c1, c2, c3, c4 = st.columns(4)
-    high_users    = int(filtered[filtered["risk_level"] == "High"]["user"].nunique())
-    high_records  = int((filtered["risk_level"] == "High").sum())
-    avg_score     = filtered["anomaly_score"].mean()
-    total_records = len(filtered)
-
-    with c1:
-        st.markdown(f"""<div class="metric-card red">
-          <div class="metric-val" style="color:#EF4444">{high_users}</div>
-          <div class="metric-lbl">High-Risk Users</div></div>""", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"""<div class="metric-card amber">
-          <div class="metric-val" style="color:#F59E0B">{high_records}</div>
-          <div class="metric-lbl">High-Risk Records</div></div>""", unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"""<div class="metric-card blue">
-          <div class="metric-val" style="color:#3B82F6">{avg_score:.3f}</div>
-          <div class="metric-lbl">Avg Anomaly Score</div></div>""", unsafe_allow_html=True)
-    with c4:
-        st.markdown(f"""<div class="metric-card green">
-          <div class="metric-val" style="color:#10B981">{total_records:,}</div>
-          <div class="metric-lbl">Filtered Records</div></div>""", unsafe_allow_html=True)
-
-    st.markdown("---")
-    col_a, col_b = st.columns([1.6, 1])
-
-    with col_a:
-        st.markdown('<div class="section-header">PCA Cluster Map (per-user behavioral features)</div>', unsafe_allow_html=True)
-        try:
-            user_pca = compute_pca(df)
-            user_pca_f = user_pca[user_pca["cluster_name"].isin(cluster_filter)]
-            fig_pca = px.scatter(
-                user_pca_f, x="PC1", y="PC2", color="cluster_name",
-                color_discrete_map=COLORS, size="max_anomaly", size_max=20,
-                hover_data={"user": True, "max_anomaly": ":.3f", "PC1": False, "PC2": False},
-                labels={"cluster_name": "Cluster"}, template="plotly_dark",
-            )
-            fig_pca.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,17,23,0.8)",
-                legend=dict(orientation="h", y=-0.18, font_size=11),
-                margin=dict(t=10, b=10), height=380,
-                xaxis=dict(showgrid=False, zeroline=False),
-                yaxis=dict(showgrid=False, zeroline=False),
-            )
-            st.plotly_chart(fig_pca, use_container_width=True)
-        except ImportError:
-            st.info("Install scikit-learn for PCA: `pip install scikit-learn`")
-
-    with col_b:
-        st.markdown('<div class="section-header">Cluster Distribution</div>', unsafe_allow_html=True)
-        cluster_counts = filtered.groupby("cluster_name")["user"].nunique().reset_index()
-        cluster_counts.columns = ["Cluster", "Users"]
-        fig_pie = px.pie(
-            cluster_counts, values="Users", names="Cluster",
-            color="Cluster", color_discrete_map=COLORS,
-            hole=0.55, template="plotly_dark",
-        )
-        fig_pie.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="v", font_size=10),
-            margin=dict(t=10, b=10), height=380,
-        )
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    st.markdown('<div class="section-header">Top 20 Anomalous User-Day Records</div>', unsafe_allow_html=True)
-    top20 = filtered.nlargest(20, "anomaly_score")[
-        ["user", "day", "anomaly_score", "risk_level", "cluster_name",
-         "total_emails", "external_ratio", "off_hours_ratio", "weekend_ratio", "avg_email_size"]
-    ].reset_index(drop=True)
-
-    st.dataframe(
-        top20.style
-             .map(color_risk, subset=["risk_level"])
-             .format({"anomaly_score": "{:.4f}", "external_ratio": "{:.2%}",
-                      "off_hours_ratio": "{:.2%}", "weekend_ratio": "{:.2%}",
-                      "avg_email_size": "{:,.0f}"}),
-        use_container_width=True, height=480
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VIEW 2 — USER DRILLDOWN
-# ══════════════════════════════════════════════════════════════════════════════
-elif view == "🔍 User Drilldown":
-    st.markdown("# User Drilldown")
-
-    selected_user = st.selectbox("Select User", all_users)
-    udf = df[df["user"] == selected_user].sort_values("day")
-
-    if udf.empty:
-        st.warning("No data for this user.")
-    else:
-        max_score = udf["anomaly_score"].max()
-        risk      = udf["risk_level"].mode()[0]
-        cluster   = udf["cluster_name"].iloc[0]
-        avg_ext   = udf["external_ratio"].mean()
-        avg_offh  = udf["off_hours_ratio"].mean()
-        avg_wknd  = udf["weekend_ratio"].mean()
-        badge_col = COLORS.get(cluster, "#64748B")
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Peak Anomaly Score", f"{max_score:.4f}")
-        c2.metric("Active Days",        len(udf))
-        c3.metric("Avg External Ratio", f"{avg_ext:.1%}")
-        c4.metric("Avg Off-Hours",      f"{avg_offh:.1%}")
-        c5.metric("Avg Weekend",        f"{avg_wknd:.1%}")
-
+    col_intro, col_metrics = st.columns([2, 1])
+    with col_intro:
         st.markdown(
-            f"**Cluster:** <span style='background:{badge_col}33;color:{badge_col};"
-            f"padding:3px 12px;border-radius:999px;font-weight:600'>{cluster}</span>"
-            f" &nbsp; **Risk:** {risk}",
+            "The **elbow method** plots training cost vs. k — the bend ('elbow') marks where adding "
+            "more clusters yields diminishing returns. The **silhouette score** measures how well "
+            "points are assigned to their own cluster vs. neighbouring clusters. "
+            "Higher is better (max = 1)."
+        )
+    with col_metrics:
+        best_row = sil_df.loc[sil_df["silhouette"].idxmax()]
+        st.markdown(
+            f"<div style='text-align:center; margin-top:8px'>"
+            f"<div class='best-k-badge'>★ Best k = {int(best_row['k'])}</div><br>"
+            f"<div style='color:#94A3B8;font-size:0.85rem'>Silhouette Score</div>"
+            f"<div style='color:#A78BFA;font-size:1.8rem;font-weight:700'>{best_row['silhouette']:.4f}</div>"
+            f"</div>",
             unsafe_allow_html=True
         )
-        st.markdown("---")
-
-        col_l, col_r = st.columns(2)
-
-        with col_l:
-            st.markdown('<div class="section-header">Anomaly Score Over Time</div>', unsafe_allow_html=True)
-            fig_line = px.line(udf, x="day", y="anomaly_score", markers=True,
-                               template="plotly_dark", color_discrete_sequence=["#3B82F6"])
-            fig_line.add_hline(y=0.50, line_dash="dot", line_color="#EF4444",
-                               annotation_text="High threshold", annotation_position="top right")
-            fig_line.add_hline(y=0.25, line_dash="dot", line_color="#F59E0B",
-                               annotation_text="Medium threshold", annotation_position="top right")
-            fig_line.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                   margin=dict(t=10, b=10), height=300)
-            st.plotly_chart(fig_line, use_container_width=True)
-
-        with col_r:
-            st.markdown('<div class="section-header">Behavioral Feature Radar</div>', unsafe_allow_html=True)
-            categories = ["External Ratio", "Off-Hours Ratio", "Weekend Ratio",
-                          "Email Volume (norm)", "Avg Size (norm)"]
-            values = [
-                avg_ext, avg_offh, avg_wknd,
-                udf["total_emails"].mean() / max(df["total_emails"].max(), 1),
-                udf["avg_email_size"].mean() / max(df["avg_email_size"].max(), 1),
-            ]
-            fig_rad = go.Figure(go.Scatterpolar(
-                r=values + [values[0]], theta=categories + [categories[0]],
-                fill="toself", fillcolor="rgba(59,130,246,0.2)",
-                line=dict(color="#3B82F6", width=2)
-            ))
-            fig_rad.update_layout(
-                polar=dict(bgcolor="rgba(0,0,0,0)",
-                           radialaxis=dict(visible=True, range=[0, 1], color="#64748B"),
-                           angularaxis=dict(color="#CBD5E1")),
-                paper_bgcolor="rgba(0,0,0,0)", margin=dict(t=20, b=10), height=300,
-                template="plotly_dark",
-            )
-            st.plotly_chart(fig_rad, use_container_width=True)
-
-        st.markdown('<div class="section-header">Email Volume & External Ratio Over Time</div>', unsafe_allow_html=True)
-        fig2 = go.Figure()
-        fig2.add_trace(go.Bar(x=udf["day"].astype(str), y=udf["total_emails"],
-                              name="Total Emails", marker_color="#3B82F6", opacity=0.8))
-        fig2.add_trace(go.Scatter(x=udf["day"].astype(str), y=udf["external_ratio"],
-                                  name="External Ratio", yaxis="y2",
-                                  line=dict(color="#EF4444", width=2), mode="lines+markers"))
-        fig2.update_layout(
-            yaxis=dict(title="Email Count", color="#3B82F6"),
-            yaxis2=dict(title="External Ratio", overlaying="y", side="right",
-                        range=[0, 1], color="#EF4444"),
-            template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", y=1.1), margin=dict(t=10, b=10), height=280
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-        st.markdown('<div class="section-header">Daily Activity Log</div>', unsafe_allow_html=True)
-        display_cols = ["day", "anomaly_score", "risk_level", "total_emails",
-                        "external_ratio", "off_hours_ratio", "weekend_ratio",
-                        "avg_email_size", "unique_pcs"]
-        st.dataframe(
-            udf[display_cols].style
-               .map(color_risk, subset=["risk_level"])
-               .format({"anomaly_score": "{:.4f}", "external_ratio": "{:.2%}",
-                        "off_hours_ratio": "{:.2%}", "weekend_ratio": "{:.2%}",
-                        "avg_email_size": "{:,.0f}"}),
-            use_container_width=True, height=350
-        )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VIEW 3 — CLUSTER ANALYSIS
-# ══════════════════════════════════════════════════════════════════════════════
-elif view == "🤖 Cluster Analysis":
-    st.markdown("# Cluster Analysis")
-    st.markdown("Behavioral breakdown of each cluster derived from the real email activity features.")
-
-    cluster_summary = (
-        df.groupby("cluster_name")
-        .agg(
-            users        =("user", "nunique"),
-            records      =("anomaly_score", "count"),
-            avg_score    =("anomaly_score", "mean"),
-            avg_external =("external_ratio", "mean"),
-            avg_offhours =("off_hours_ratio", "mean"),
-            avg_weekend  =("weekend_ratio", "mean"),
-            avg_emails   =("total_emails", "mean"),
-        )
-        .reset_index()
-        .sort_values("avg_score", ascending=False)
-    )
-
-    st.markdown('<div class="section-header">Cluster Summary</div>', unsafe_allow_html=True)
-    st.dataframe(
-        cluster_summary.style
-            .background_gradient(subset=["avg_score"], cmap="Reds")
-            .background_gradient(subset=["avg_external"], cmap="Oranges")
-            .format({"avg_score": "{:.3f}", "avg_external": "{:.2%}",
-                     "avg_offhours": "{:.2%}", "avg_weekend": "{:.2%}",
-                     "avg_emails": "{:.1f}"}),
-        use_container_width=True
-    )
 
     st.markdown("---")
-    col_a, col_b = st.columns(2)
 
-    with col_a:
-        st.markdown('<div class="section-header">Avg Anomaly Score by Cluster</div>', unsafe_allow_html=True)
-        fig_bar = px.bar(
-            cluster_summary.sort_values("avg_score"),
-            x="avg_score", y="cluster_name", orientation="h",
-            color="cluster_name", color_discrete_map=COLORS,
-            template="plotly_dark", text="avg_score",
+    # Slider for k
+    selected_k = st.slider(
+        "Select number of clusters (k)",
+        min_value=2, max_value=8, value=5, step=1
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown('<div class="section-header">Silhouette Score vs. k</div>', unsafe_allow_html=True)
+        fig_sil = go.Figure()
+        best_k_row = sil_df.loc[sil_df["silhouette"].idxmax()]
+        colors = ["#A78BFA" if k == int(best_k_row["k"]) else "#3B82F6" for k in sil_df["k"]]
+
+        fig_sil.add_trace(go.Scatter(
+            x=sil_df["k"], y=sil_df["silhouette"],
+            mode="lines+markers", marker=dict(size=12),
+            line=dict(color="#3B82F6", width=2.5),
+            text=[f"k={int(r['k'])}<br>Silhouette={r['silhouette']:.4f}" for _, r in sil_df.iterrows()],
+            hovertemplate="%{text}<extra></extra>",
+        ))
+
+        # Highlight selected k
+        sel_sil = sil_df.loc[sil_df["k"] == selected_k, "silhouette"].values[0]
+        fig_sil.add_trace(go.Scatter(
+            x=[selected_k], y=[sel_sil],
+            mode="markers", marker=dict(size=18, color="#EF4444", symbol="star"),
+        ))
+        fig_sil.add_hline(
+            y=sil_df["silhouette"].mean(), line_dash="dot", line_color="#64748B",
+            annotation_text="Mean silhouette", annotation_position="bottom right"
         )
-        fig_bar.update_traces(texttemplate="%{text:.3f}", textposition="outside")
-        fig_bar.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                              showlegend=False, margin=dict(t=10, b=10), height=320,
-                              xaxis_title="Avg Anomaly Score")
+        dark_layout(fig_sil, height=340,
+            xaxis=dict(title="k (number of clusters)", tickmode="linear", tick0=2, dtick=1),
+            yaxis=dict(title="Silhouette Score", range=[0.3, 0.7]),
+            margin=dict(t=10, b=10),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_sil, use_container_width=True)
+
+    with col2:
+        st.markdown('<div class="section-header">Elbow Curve (Training Cost)</div>', unsafe_allow_html=True)
+        fig_elbow = go.Figure()
+        fig_elbow.add_trace(go.Scatter(
+            x=sil_df["k"], y=sil_df["training_cost"],
+            mode="lines+markers", marker=dict(size=12),
+            line=dict(color="#F59E0B", width=2.5),
+            text=[f"k={int(r['k'])}<br>Cost={r['training_cost']:,.0f}" for _, r in sil_df.iterrows()],
+            hovertemplate="%{text}<extra></extra>",
+        ))
+        # Highlight selected k
+        sel_cost = sil_df.loc[sil_df["k"] == selected_k, "training_cost"].values[0]
+        fig_elbow.add_trace(go.Scatter(
+            x=[selected_k], y=[sel_cost],
+            mode="markers", marker=dict(size=18, color="#EF4444", symbol="star"),
+        ))
+        dark_layout(fig_elbow, height=340,
+            xaxis=dict(title="k (number of clusters)", tickmode="linear", tick0=2, dtick=1),
+            yaxis=dict(title="Training Cost (Within-cluster SSE)", range=[500, 2300]),
+            margin=dict(t=10, b=10),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_elbow, use_container_width=True)
+
+    # Info box
+    selected_row = sil_df.loc[sil_df["k"] == selected_k].iloc[0]
+    is_best = (selected_k == int(best_k_row["k"]))
+    badge = "✅ BEST K" if is_best else f"( Best = k={int(best_k_row['k'])} )"
+    st.markdown(
+        f"**k = {selected_k}** — Silhouette: `{selected_row['silhouette']:.4f}` | "
+        f"Training Cost: `{selected_row['training_cost']:,.0f}` | Iterations: `{int(selected_row['iterations'])}`"
+        f" &nbsp;&nbsp;{badge}",
+        unsafe_allow_html=True
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 — MODEL COMPARISON
+# ══════════════════════════════════════════════════════════════════════════════
+def page2_model_comparison():
+    st.markdown("# Model Comparison")
+    st.markdown(
+        "**SparkKMeans vs. CustomKMeans vs. DBSCAN vs. HDBSCAN** — "
+        "an honest, academic head-to-head on the CERT email data. "
+        "No cherry-picking: all four algorithms are measured on the same 398 user-day records."
+    )
+
+    model_df = load_final_model()
+
+    # Clean up runtime display
+    model_df["runtime_disp"] = model_df["runtime_sec"].apply(
+        lambda x: f"{x*1000:.1f} ms" if x < 1 else f"{x:.2f} s"
+    )
+
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        st.markdown('<div class="section-header">Runtime (ms) — lower is better</div>', unsafe_allow_html=True)
+        rt_colors = ["#EF4444" if m in ["HDBSCAN", "DBSCAN"] else "#3B82F6" for m in model_df["model"]]
+        fig_rt = go.Figure()
+        fig_rt.add_trace(go.Bar(
+            x=model_df["model"], y=model_df["runtime_sec"] * 1000,
+            marker_color=rt_colors,
+            text=[f"{v*1000:.1f} ms" for v in model_df["runtime_sec"]],
+            textposition="outside",
+        ))
+        dark_layout(fig_rt, height=300, margin=dict(t=10, b=10),
+            yaxis=dict(title="Runtime (ms)", type="log"),
+            xaxis=dict(title=""))
+        st.plotly_chart(fig_rt, use_container_width=True)
+
+    with col_m2:
+        st.markdown('<div class="section-header">Silhouette Score — higher is better</div>', unsafe_allow_html=True)
+        sil_colors = ["#A78BFA" if m == "SparkKMeans" else "#3B82F6" for m in model_df["model"]]
+        fig_sil = go.Figure()
+        fig_sil.add_trace(go.Bar(
+            x=model_df["model"], y=model_df["silhouette"],
+            marker_color=sil_colors,
+            text=[f"{v:.4f}" for v in model_df["silhouette"]],
+            textposition="outside",
+        ))
+        fig_sil.add_hline(y=0.5, line_dash="dot", line_color="#64748B",
+            annotation_text="0.5 threshold", annotation_position="bottom right")
+        dark_layout(fig_sil, height=300, margin=dict(t=10, b=10),
+            yaxis=dict(title="Silhouette Score", range=[0, 0.7]),
+            xaxis=dict(title=""))
+        st.plotly_chart(fig_sil, use_container_width=True)
+
+    # Runtime vs Silhouette scatter
+    st.markdown('<div class="section-header">Runtime vs. Silhouette — the quality/speed tradeoff</div>', unsafe_allow_html=True)
+    fig_sc = go.Figure()
+    for _, row in model_df.iterrows():
+        size = 18 if row["model"] == "SparkKMeans" else 12
+        fig_sc.add_trace(go.Scatter(
+            x=[row["runtime_sec"] * 1000], y=[row["silhouette"]],
+            mode="markers+text",
+            marker=dict(size=size, color=CLUSTER_COLORS.get(row["model"], "#3B82F6")),
+            text=[row["model"]],
+            textposition="top center",
+            textfont=dict(color="#E2E8F0", size=12),
+            hovertemplate=(
+                f"<b>{{text}}</b><br>"
+                f"Silhouette: {{y:.4f}}<br>"
+                f"Runtime: {row['runtime_sec']*1000:.1f} ms<br>"
+                f"k={int(row['k'])}<extra></extra>"
+            ),
+        ))
+    fig_sc.update_traces(
+        hovertemplate=(
+            "<b>%{text}</b><br>"
+            "Silhouette: %{y:.4f}<br>"
+            "Runtime: %{x:.1f} ms<extra></extra>"
+        )
+    )
+    dark_layout(fig_sc, height=340, margin=dict(t=10, b=10),
+        xaxis=dict(title="Runtime (ms, log scale)", type="log"),
+        yaxis=dict(title="Silhouette Score"),
+        showlegend=False)
+    st.plotly_chart(fig_sc, use_container_width=True)
+
+    # Metrics table
+    st.markdown("---")
+    st.markdown('<div class="section-header">Full Metrics Table</div>', unsafe_allow_html=True)
+    disp = model_df.copy()
+    disp["k"] = disp["k"].astype(int)
+    disp = disp.rename(columns={
+        "model": "Model", "k": "k", "silhouette": "Silhouette",
+        "training_cost": "Training Cost", "iterations": "Iterations",
+        "runtime_disp": "Runtime", "davies_bouldin": "Davies-Bouldin",
+        "calinski_harabasz": "Calinski-Harabasz"
+    })
+    st.dataframe(
+        disp[["Model", "k", "Silhouette", "Training Cost", "Iterations", "Runtime",
+              "Davies-Bouldin", "Calinski-Harabasz"]]
+        .style.background_gradient(subset=["Silhouette"], cmap="Purples")
+        .format({
+            "Silhouette": "{:.4f}",
+            "Training Cost": "{:.1f}",
+            "Iterations": "{:.0f}",
+            "Davies-Bouldin": "{:.4f}",
+            "Calinski-Harabasz": "{:.2f}",
+        }, na_rep="—"),
+        use_container_width=True, height=280
+    )
+
+    st.markdown(
+        "**Winner: SparkKMeans** (silhouette=0.5829) — but HDBSCAN runs **1,900× faster** "
+        "and still achieves strong separation (0.5343). "
+        "DBSCAN produces the most compact clusters (lowest Davies-Bouldin=0.857)."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 — CLUSTER PROFILES
+# ══════════════════════════════════════════════════════════════════════════════
+def page3_cluster_profiles():
+    st.markdown("# Cluster Profiles")
+    st.markdown(
+        "*What does each cluster actually mean?* Each radar chart shows a cluster's "
+        "centroid fingerprint across all 12 behavioral features. "
+        "Outer = higher value. The bar chart below shows which features drive cluster separation."
+    )
+
+    selected_cluster_view = st.selectbox(
+        "View cluster profile",
+        ["All Clusters", "High-Risk Exfiltrators", "Elevated Suspicion",
+         "Weekend Activity", "Off-Hours Pattern", "Normal Baseline"]
+    )
+
+    col_left, col_right = st.columns([1, 1])
+
+    with col_left:
+        st.markdown('<div class="section-header">Radar Chart — Centroid Feature Fingerprint</div>', unsafe_allow_html=True)
+
+        if selected_cluster_view == "All Clusters":
+            fig_rad = go.Figure()
+            for cid, cent in norm_centroids.items():
+                cname = CLUSTER_NAMES.get(cid, f"Cluster {cid}")
+                color = CLUSTER_COLORS.get(cname, "#3B82F6")
+                fig_rad.add_trace(go.Scatterpolar(
+                    r=list(cent) + [cent[0]],
+                    theta=FEATURE_LABELS + [FEATURE_LABELS[0]],
+                    mode="lines",
+                    name=cname,
+                    line=dict(color=color, width=2),
+                    opacity=0.7,
+                    hovertemplate="%{theta}<br>%{r:.3f}<extra></extra>",
+                ))
+            dark_layout(fig_rad, height=440, margin=dict(t=10, b=10),
+                polar=dict(
+                    bgcolor="rgba(0,0,0,0)",
+                    radialaxis=dict(visible=True, range=[0, 1], color="#64748B"),
+                    angularaxis=dict(color="#CBD5E1", tickangle=25),
+                ),
+                showlegend=True,
+                legend=dict(orientation="h", y=-0.2, font_size=11),
+            )
+        else:
+            cid_map = {v: k for k, v in CLUSTER_NAMES.items()}
+            cid = cid_map[selected_cluster_view]
+            cent = norm_centroids[cid]
+            color = CLUSTER_COLORS.get(selected_cluster_view, "#3B82F6")
+            fig_rad = go.Figure()
+            fig_rad.add_trace(go.Scatterpolar(
+                r=list(cent) + [cent[0]],
+                theta=FEATURE_LABELS + [FEATURE_LABELS[0]],
+                mode="lines+markers",
+                fill="toself",
+                fillcolor=f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},0.25)",
+                line=dict(color=color, width=2.5),
+                marker=dict(size=6, color=color),
+                hovertemplate="%{theta}<br>%{r:.3f}<extra></extra>",
+            ))
+            dark_layout(fig_rad, height=440, margin=dict(t=10, b=10),
+                polar=dict(
+                    bgcolor="rgba(0,0,0,0)",
+                    radialaxis=dict(visible=True, range=[0, 1], color="#64748B"),
+                    angularaxis=dict(color="#CBD5E1", tickangle=25),
+                ),
+                showlegend=False,
+            )
+        st.plotly_chart(fig_rad, use_container_width=True)
+
+    with col_right:
+        st.markdown('<div class="section-header">Feature Separation — Which Features Drive Cluster Boundaries?</div>', unsafe_allow_html=True)
+
+        # Compute feature importance: ratio of between-cluster variance to total variance
+        raw_centroids = np.vstack(list(clusterCentroids.values()))
+        cluster_means = raw_centroids.mean(axis=0)
+        between_var = ((raw_centroids - cluster_means) ** 2).mean(axis=0)
+        total_var = raw_centroids.var(axis=0)
+        sep_score = between_var / (total_var + 1e-10)
+
+        feat_importance = pd.DataFrame({
+            "Feature": FEATURE_LABELS,
+            "Separation Score": sep_score,
+        }).sort_values("Separation Score", ascending=True)
+
+        fig_bar = go.Figure()
+        fig_bar.add_trace(go.Bar(
+            x=feat_importance["Separation Score"],
+            y=feat_importance["Feature"],
+            orientation="h",
+            marker=dict(
+                color=feat_importance["Separation Score"],
+                colorscale="Plasma",
+            ),
+            text=[f"{v:.3f}" for v in feat_importance["Separation Score"]],
+            textposition="outside",
+        ))
+        dark_layout(fig_bar, height=440, margin=dict(t=10, b=10),
+            xaxis=dict(title="Separation Score (higher = better cluster separation)"),
+            yaxis=dict(title=""),
+            showlegend=False,
+        )
         st.plotly_chart(fig_bar, use_container_width=True)
 
-    with col_b:
-        st.markdown('<div class="section-header">Feature Breakdown by Cluster</div>', unsafe_allow_html=True)
-        feat_melt = cluster_summary.melt(
-            id_vars="cluster_name",
-            value_vars=["avg_external", "avg_offhours", "avg_weekend"],
-            var_name="Feature", value_name="Value"
-        )
-        feat_melt["Feature"] = feat_melt["Feature"].map({
-            "avg_external": "External Ratio",
-            "avg_offhours": "Off-Hours Ratio",
-            "avg_weekend":  "Weekend Ratio"
+    # Cluster summary table
+    st.markdown("---")
+    st.markdown('<div class="section-header">Cluster Centroid Summary</div>', unsafe_allow_html=True)
+    summary_rows = []
+    for cid, cent in clusterCentroids.items():
+        cname = CLUSTER_NAMES.get(cid, f"Cluster {cid}")
+        summary_rows.append({
+            "Cluster": cname,
+            "Top Feature 1": FEATURE_LABELS[np.argmax(cent)],
+            "Top Feature 2": FEATURE_LABELS[np.argsort(cent)[-2]],
+            "External Ratio": f"{cent[FEATURE_LABELS.index('External Ratio')]:.3f}",
+            "Off-Hours Ratio": f"{cent[FEATURE_LABELS.index('Off-Hours Ratio')]:.3f}",
+            "Weekend Ratio": f"{cent[FEATURE_LABELS.index('Weekend Ratio')]:.3f}",
         })
-        fig_grp = px.bar(
-            feat_melt, x="cluster_name", y="Value", color="Feature",
-            barmode="group", template="plotly_dark",
-            color_discrete_sequence=["#EF4444", "#F59E0B", "#8B5CF6"],
-        )
-        fig_grp.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                              margin=dict(t=10, b=10), height=320,
-                              xaxis_title="", yaxis_title="Ratio",
-                              legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(fig_grp, use_container_width=True)
-
-    st.markdown('<div class="section-header">Score Distribution per Cluster</div>', unsafe_allow_html=True)
-    fig_box = px.box(
-        filtered, x="cluster_name", y="anomaly_score",
-        color="cluster_name", color_discrete_map=COLORS,
-        template="plotly_dark", points="outliers",
-    )
-    fig_box.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                          showlegend=False, margin=dict(t=10, b=10), height=350,
-                          xaxis_title="", yaxis_title="Anomaly Score")
-    st.plotly_chart(fig_box, use_container_width=True)
-
-    st.markdown('<div class="section-header">Users per Cluster</div>', unsafe_allow_html=True)
-    user_cluster = (
-        df.groupby(["user", "cluster_name"])["anomaly_score"]
-        .max().reset_index()
-        .sort_values("anomaly_score", ascending=False)
-    )
-    selected_cluster = st.selectbox("Filter by Cluster", ["All"] + list(COLORS.keys()))
-    if selected_cluster != "All":
-        user_cluster = user_cluster[user_cluster["cluster_name"] == selected_cluster]
+    summary_df = pd.DataFrame(summary_rows)
     st.dataframe(
-        user_cluster.style.format({"anomaly_score": "{:.4f}"}),
+        summary_df.style.map(
+            lambda val: f"color:{CLUSTER_COLORS.get(val, '#E2E8F0')}" if val in CLUSTER_COLORS else "",
+            subset=["Cluster"]
+        ),
+        use_container_width=True, height=260
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 4 — ANOMALY EXPLORER
+# ══════════════════════════════════════════════════════════════════════════════
+def page4_anomaly_explorer():
+    st.markdown("# Anomaly Explorer")
+    st.markdown(
+        "Anomaly score = distance from cluster centroid (CustomKMeans, k=5). "
+        "Higher score = more unusual behavioral pattern. "
+        "Use the **catch-rate slider** to see how many users get flagged at each threshold."
+    )
+
+    anomaly_df = load_top_anomalies()
+
+    # Top anomalies bar chart
+    st.markdown('<div class="section-header">Top Anomalous User-Day Records</div>', unsafe_allow_html=True)
+    top_n = 15
+    top_n_df = anomaly_df.head(top_n).copy()
+    top_n_df["label"] = top_n_df["user"].astype(str) + " | " + top_n_df["day"].astype(str)
+
+    fig_bar = go.Figure()
+    fig_bar.add_trace(go.Bar(
+        x=top_n_df["anomaly_score"],
+        y=top_n_df["label"],
+        orientation="h",
+        marker=dict(
+            color=top_n_df["anomaly_score"],
+            colorscale="Reds",
+            cmin=top_n_df["anomaly_score"].min(),
+            cmax=top_n_df["anomaly_score"].max(),
+        ),
+        text=[f"{v:.2f}" for v in top_n_df["anomaly_score"]],
+        textposition="outside",
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Anomaly Score: %{x:.4f}<br>"
+            "Emails: " + top_n_df["total_emails"].astype(str) + "<br>"
+            "External Ratio: " + top_n_df["external_ratio"].apply(lambda v: f"{v:.2%}") + "<br>"
+            "<extra></extra>"
+        ),
+    ))
+    dark_layout(fig_bar, height=400, margin=dict(t=10, b=10),
+        xaxis=dict(title="Anomaly Score (distance from centroid)"),
+        yaxis=dict(title=""),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+    st.markdown("---")
+
+    col_cal, col_thresh = st.columns([1.2, 1])
+
+    with col_cal:
+        st.markdown('<div class="section-header">User-Day Timeline Heatmap</div>', unsafe_allow_html=True)
+        anomaly_df["day"] = pd.to_datetime(anomaly_df["day"])
+        anomaly_df["month"] = anomaly_df["day"].dt.to_period("M")
+        anomaly_df["weekday"] = anomaly_df["day"].dt.day_name()
+
+        heatmap_data = anomaly_df.groupby(["month", "weekday"])["anomaly_score"].mean().reset_index()
+        heatmap_data["month"] = heatmap_data["month"].astype(str)
+        weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        heatmap_data = heatmap_data[heatmap_data["weekday"].isin(weekday_order)]
+
+        pivot = heatmap_data.pivot(index="weekday", columns="month", values="anomaly_score")
+        pivot = pivot.reindex(index=weekday_order)
+
+        fig_heat = go.Figure(data=go.Heatmap(
+            z=pivot.values,
+            x=pivot.columns.tolist(),
+            y=pivot.index.tolist(),
+            colorscale="YlOrRd",
+            colorbar=dict(title="Avg Anomaly Score"),
+            hovertemplate=" %{y} %{x}<br>Score: %{z:.3f}<extra></extra>",
+        ))
+        dark_layout(fig_heat, height=360, margin=dict(t=10, b=10))
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+    with col_thresh:
+        st.markdown('<div class="section-header">Catch Rate Threshold Slider</div>', unsafe_allow_html=True)
+        all_records = load_top_anomalies()
+        threshold = st.slider(
+            "Flag users with anomaly score ≥",
+            min_value=float(all_records["anomaly_score"].min()),
+            max_value=float(all_records["anomaly_score"].max()),
+            value=2.5,
+            step=0.1,
+        )
+        flagged = all_records[all_records["anomaly_score"] >= threshold]
+        catch_rate = len(flagged) / len(all_records) * 100
+        total_users = all_records["user"].nunique()
+        flagged_users = flagged["user"].nunique()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"""<div class="metric-card red">
+              <div class="metric-val" style="color:#EF4444">{len(flagged)}</div>
+              <div class="metric-lbl">Records Flagged</div></div>""", unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"""<div class="metric-card amber">
+              <div class="metric-val" style="color:#F59E0B">{flagged_users}/{total_users}</div>
+              <div class="metric-lbl">Users Flagged</div></div>""", unsafe_allow_html=True)
+
+        st.markdown(
+            f"**{catch_rate:.1f}%** of user-day records flagged at threshold ≥ `{threshold:.2f}`"
+        )
+
+        # CDF curve of catch rate
+        all_scores = sorted(all_records["anomaly_score"].unique())
+        thresholds = np.linspace(all_records["anomaly_score"].min(),
+                                 all_records["anomaly_score"].max(), 100)
+        catch_pct = [(all_records["anomaly_score"] >= t).sum() / len(all_records) * 100
+                     for t in thresholds]
+
+        fig_cdf = go.Figure()
+        fig_cdf.add_trace(go.Scatter(
+            x=thresholds, y=catch_pct,
+            mode="lines", line=dict(color="#3B82F6", width=2.5),
+            fill="tozeroy", fillcolor="rgba(59,130,246,0.15)",
+            hovertemplate="Threshold: %{x:.2f}<br>Catch Rate: %{y:.1f}%<extra></extra>",
+        ))
+        fig_cdf.add_vline(x=threshold, line_dash="dot", line_color="#EF4444", line_width=2)
+        dark_layout(fig_cdf, height=260, margin=dict(t=10, b=10),
+            xaxis=dict(title="Anomaly Score Threshold"),
+            yaxis=dict(title="Records Caught (%)", range=[0, 100]),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_cdf, use_container_width=True)
+
+    # Bottom: full anomaly table
+    st.markdown("---")
+    st.markdown('<div class="section-header">All Flagged User-Day Records</div>', unsafe_allow_html=True)
+    disp_cols = ["user", "day", "anomaly_score", "total_emails", "external_ratio",
+                 "off_hours_ratio", "weekend_ratio", "avg_email_size", "custom_cluster"]
+    st.dataframe(
+        flagged[disp_cols].style
+            .background_gradient(subset=["anomaly_score"], cmap="Reds")
+            .format({"anomaly_score": "{:.4f}", "external_ratio": "{:.2%}",
+                     "off_hours_ratio": "{:.2%}", "weekend_ratio": "{:.2%}",
+                     "avg_email_size": "{:,.0f}"}, na_rep="—"),
         use_container_width=True, height=350
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VIEW 4 — ANOMALY EXPLORER
+# MAIN — page navigation via radio buttons
 # ══════════════════════════════════════════════════════════════════════════════
-elif view == "📡 Anomaly Explorer":
-    st.markdown("# Anomaly Explorer")
-    st.markdown("Explore raw feature distributions and anomaly patterns across all records.")
+PAGES = {
+    "🔬 K Selection Lab":        page1_k_selection,
+    "⚖️ Model Comparison":       page2_model_comparison,
+    "📊 Cluster Profiles":       page3_cluster_profiles,
+    "🚨 Anomaly Explorer":       page4_anomaly_explorer,
+}
 
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.markdown('<div class="section-header">Anomaly Score Distribution</div>', unsafe_allow_html=True)
-        fig_hist = px.histogram(
-            filtered, x="anomaly_score", nbins=40,
-            color="risk_level",
-            color_discrete_map={"High": "#EF4444", "Medium": "#F59E0B", "Low": "#10B981"},
-            template="plotly_dark", barmode="overlay", opacity=0.8,
-        )
-        fig_hist.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                               margin=dict(t=10, b=10), height=300,
-                               xaxis_title="Anomaly Score", yaxis_title="Record Count")
-        st.plotly_chart(fig_hist, use_container_width=True)
-
-    with col_b:
-        st.markdown('<div class="section-header">External Ratio vs Off-Hours Ratio</div>', unsafe_allow_html=True)
-        fig_sc = px.scatter(
-            filtered, x="external_ratio", y="off_hours_ratio",
-            color="cluster_name", color_discrete_map=COLORS,
-            size="anomaly_score", size_max=18, opacity=0.75,
-            template="plotly_dark",
-            hover_data={"user": True, "anomaly_score": ":.3f", "day": True},
-        )
-        fig_sc.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                             margin=dict(t=10, b=10), height=300,
-                             legend=dict(orientation="h", y=-0.25, font_size=10))
-        st.plotly_chart(fig_sc, use_container_width=True)
-
-    st.markdown('<div class="section-header">Feature Correlation Heatmap</div>', unsafe_allow_html=True)
-    feat_cols = ["anomaly_score", "external_ratio", "off_hours_ratio", "weekend_ratio",
-                 "total_emails", "avg_email_size", "unique_pcs", "total_recipients"]
-    corr = filtered[feat_cols].corr().round(3)
-    fig_heat = px.imshow(
-        corr, text_auto=True, aspect="auto",
-        color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
-        template="plotly_dark",
-    )
-    fig_heat.update_layout(paper_bgcolor="rgba(0,0,0,0)", margin=dict(t=10, b=10), height=420)
-    st.plotly_chart(fig_heat, use_container_width=True)
-
-    st.markdown('<div class="section-header">Anomaly Score Over Time (daily avg & max)</div>', unsafe_allow_html=True)
-    filtered["day_dt"] = pd.to_datetime(filtered["day"])
-    daily = filtered.groupby("day_dt")["anomaly_score"].agg(["mean", "max"]).reset_index()
-    fig_ts = go.Figure()
-    fig_ts.add_trace(go.Scatter(x=daily["day_dt"], y=daily["mean"],
-                                mode="lines", name="Daily Avg",
-                                line=dict(color="#3B82F6", width=2)))
-    fig_ts.add_trace(go.Scatter(x=daily["day_dt"], y=daily["max"],
-                                mode="lines", name="Daily Max",
-                                line=dict(color="#EF4444", width=1.5, dash="dot")))
-    fig_ts.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        template="plotly_dark", height=280, margin=dict(t=10, b=10),
-        legend=dict(orientation="h", y=1.1),
-        xaxis_title="Date", yaxis_title="Anomaly Score"
-    )
-    st.plotly_chart(fig_ts, use_container_width=True)
-
-    st.markdown('<div class="section-header">Top Users by Peak Anomaly Score</div>', unsafe_allow_html=True)
-    top_users = (
-        filtered.groupby("user")
-        .agg(peak_score  =("anomaly_score", "max"),
-             avg_score   =("anomaly_score", "mean"),
-             active_days =("day", "count"),
-             cluster     =("cluster_name", lambda x: x.mode()[0]))
-        .reset_index()
-        .sort_values("peak_score", ascending=False)
-        .head(30)
-    )
-    st.dataframe(
-        top_users.style
-                 .background_gradient(subset=["peak_score"], cmap="Reds")
-                 .format({"peak_score": "{:.4f}", "avg_score": "{:.4f}"}),
-        use_container_width=True, height=400
-    )
+st.markdown("## 🛡️ CERT Insider Threat — Interactive Report")
+active_page = st.radio("", list(PAGES.keys()), index=0, label_visibility="collapsed")
+PAGES[active_page]()
